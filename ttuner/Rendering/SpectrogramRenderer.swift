@@ -17,12 +17,15 @@ private struct Uniforms {
     var isLandscape: Float = 0
     var scrubOffsetNorm: Float = 0
     var pitchTrailCount: Float = 0
+    var showHeatmap: Float = 0
+    var bandSizeNorm: Float = 0.05
 }
 
 private struct BeatVertexIn {
     var along: Float
     var across: Float
     var accent: Float
+    var track: Float
 }
 
 private struct PitchVertexIn {
@@ -31,8 +34,12 @@ private struct PitchVertexIn {
     var clarity: Float
 }
 
-/// Manages the Metal pipeline, the ring texture for the spectrogram, and the
-/// per-frame uniforms used by `Shaders.metal`. Driven by a `CADisplayLink`.
+private struct HeatmapVertexIn {
+    var along: Float
+    var across: Float
+    var magnitude: Float
+}
+
 final class SpectrogramRenderer: NSObject, MTKViewDelegate {
     private let device: MTLDevice
     private let queue: MTLCommandQueue
@@ -43,6 +50,7 @@ final class SpectrogramRenderer: NSObject, MTKViewDelegate {
     private var pipeline: MTLRenderPipelineState
     private var beatPipeline: MTLRenderPipelineState
     private var pitchPipeline: MTLRenderPipelineState
+    private var heatmapPipeline: MTLRenderPipelineState
 
     private let textureColumns: Int
     private let textureRows: Int
@@ -55,8 +63,9 @@ final class SpectrogramRenderer: NSObject, MTKViewDelegate {
     private var beatInstanceCount: Int = 0
     private var pitchVertexBuffer: MTLBuffer?
     private var pitchVertexCount: Int = 0
+    private var heatmapVertexBuffer: MTLBuffer?
+    private var heatmapVertexCount: Int = 0
 
-    // Public visuals knobs
     var visibleSeconds: Float = 8
     var displayMinHz: Float = 50
     var displayMaxHz: Float = 4_000
@@ -66,6 +75,7 @@ final class SpectrogramRenderer: NSObject, MTKViewDelegate {
     var dbCeil: Float = 0
     var orientation: AppOrientation = .portrait
     var scrubMode: ScrubMode = .live
+    var heatmapEnabled: Bool = false
 
     init?(view: MTKView, displayBins: Int, textureColumns: Int = 1024) {
         guard let device = view.device ?? MTLCreateSystemDefaultDevice() else { return nil }
@@ -84,7 +94,6 @@ final class SpectrogramRenderer: NSObject, MTKViewDelegate {
         descriptor.usage = [.shaderRead]
         descriptor.storageMode = .shared
         guard let tex = device.makeTexture(descriptor: descriptor) else { return nil }
-        // Initialize to -inf-equivalent (treat as floor)
         let zero = [Float16](repeating: Float16(-90), count: textureColumns * displayBins)
         tex.replace(region: MTLRegionMake2D(0, 0, textureColumns, displayBins),
                     mipmapLevel: 0,
@@ -119,42 +128,35 @@ final class SpectrogramRenderer: NSObject, MTKViewDelegate {
             let vsBeat = library.makeFunction(name: "vs_beat"),
             let fsBeat = library.makeFunction(name: "fs_beat"),
             let vsPitch = library.makeFunction(name: "vs_pitch"),
-            let fsPitch = library.makeFunction(name: "fs_pitch")
+            let fsPitch = library.makeFunction(name: "fs_pitch"),
+            let vsHeat = library.makeFunction(name: "vs_heatmap"),
+            let fsHeat = library.makeFunction(name: "fs_heatmap")
         else {
             return nil
         }
 
-        let pd = MTLRenderPipelineDescriptor()
-        pd.vertexFunction = vsFull
-        pd.fragmentFunction = fsSpectro
-        pd.colorAttachments[0].pixelFormat = view.colorPixelFormat
-        pd.colorAttachments[0].isBlendingEnabled = true
-        pd.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-        pd.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-        pd.colorAttachments[0].sourceAlphaBlendFactor = .one
-        pd.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
-        guard let spectroPipeline = try? device.makeRenderPipelineState(descriptor: pd) else { return nil }
-        self.pipeline = spectroPipeline
+        func makePipeline(vs: MTLFunction, fs: MTLFunction, blend: Bool = true) throws -> MTLRenderPipelineState {
+            let pd = MTLRenderPipelineDescriptor()
+            pd.vertexFunction = vs
+            pd.fragmentFunction = fs
+            pd.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            pd.colorAttachments[0].isBlendingEnabled = blend
+            pd.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+            pd.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            pd.colorAttachments[0].sourceAlphaBlendFactor = .one
+            pd.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            return try device.makeRenderPipelineState(descriptor: pd)
+        }
 
-        let bd = MTLRenderPipelineDescriptor()
-        bd.vertexFunction = vsBeat
-        bd.fragmentFunction = fsBeat
-        bd.colorAttachments[0].pixelFormat = view.colorPixelFormat
-        bd.colorAttachments[0].isBlendingEnabled = true
-        bd.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-        bd.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-        guard let beatP = try? device.makeRenderPipelineState(descriptor: bd) else { return nil }
-        self.beatPipeline = beatP
-
-        let pd2 = MTLRenderPipelineDescriptor()
-        pd2.vertexFunction = vsPitch
-        pd2.fragmentFunction = fsPitch
-        pd2.colorAttachments[0].pixelFormat = view.colorPixelFormat
-        pd2.colorAttachments[0].isBlendingEnabled = true
-        pd2.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-        pd2.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-        guard let pitchP = try? device.makeRenderPipelineState(descriptor: pd2) else { return nil }
-        self.pitchPipeline = pitchP
+        guard let p1 = try? makePipeline(vs: vsFull, fs: fsSpectro),
+              let p2 = try? makePipeline(vs: vsBeat, fs: fsBeat),
+              let p3 = try? makePipeline(vs: vsPitch, fs: fsPitch),
+              let p4 = try? makePipeline(vs: vsHeat, fs: fsHeat)
+        else { return nil }
+        self.pipeline = p1
+        self.beatPipeline = p2
+        self.pitchPipeline = p3
+        self.heatmapPipeline = p4
 
         super.init()
         view.delegate = self
@@ -171,7 +173,6 @@ final class SpectrogramRenderer: NSObject, MTKViewDelegate {
                                 bytesPerRow: 0)
     }
 
-    /// Append one spectrum column (display-bin values in dB).
     func append(column: [Float]) {
         guard column.count == textureRows else { return }
         var half = [Float16](repeating: 0, count: textureRows)
@@ -184,24 +185,20 @@ final class SpectrogramRenderer: NSObject, MTKViewDelegate {
         writeColumn = (writeColumn + 1) % textureColumns
     }
 
-    // MARK: - Beat markers
     func updateBeats(_ markers: [BeatMarker], visibleSecondsCap: Float) {
         let nowHost = mach_absolute_time()
-        // Precompute mach time → seconds
         let secondsPerTick = machSecondsPerTick()
         var verts: [BeatVertexIn] = []
         verts.reserveCapacity(markers.count * 2)
         for m in markers where m.accent != .off {
-            // age in seconds (positive in the past, negative in the future)
             let dt = Double(Int64(nowHost) - Int64(m.hostTime)) * secondsPerTick
-            // The marker is visible when 0 <= dt <= visibleSeconds (already on screen)
-            // or when -visibleSeconds/4 <= dt < 0 (just-about-to-tick, fades in)
             if dt < -Double(visibleSecondsCap) * 0.25 || dt > Double(visibleSecondsCap) { continue }
             let timeNorm = 1.0 - dt / Double(visibleSecondsCap)
             let along = Float(timeNorm) * 2.0 - 1.0
             let acc: Float = Float(m.accent.rawValue)
-            verts.append(BeatVertexIn(along: along, across: -1, accent: acc))
-            verts.append(BeatVertexIn(along: along, across:  1, accent: acc))
+            let trk: Float = Float(m.trackId)
+            verts.append(BeatVertexIn(along: along, across: -1, accent: acc, track: trk))
+            verts.append(BeatVertexIn(along: along, across:  1, accent: acc, track: trk))
         }
         beatInstanceCount = verts.count / 2
         if verts.isEmpty {
@@ -215,7 +212,6 @@ final class SpectrogramRenderer: NSObject, MTKViewDelegate {
         beatVertexBuffer!.contents().copyMemory(from: verts, byteCount: len)
     }
 
-    // MARK: - Pitch trail
     func updatePitchTrail(_ trail: [PitchEvent], referenceA: Double, transpose: Int) {
         let nowHost = mach_absolute_time()
         let secondsPerTick = machSecondsPerTick()
@@ -246,6 +242,35 @@ final class SpectrogramRenderer: NSObject, MTKViewDelegate {
         pitchVertexBuffer!.contents().copyMemory(from: verts, byteCount: len)
     }
 
+    /// `samples` is an ordered series of (ageSeconds, |cents|/50) for the heatmap band.
+    /// Each sample becomes two vertices (across=-1, +1) forming a quad strip.
+    func updateHeatmap(samples: [(ageSeconds: Double, magnitude: Float)]) {
+        guard heatmapEnabled, !samples.isEmpty else {
+            heatmapVertexBuffer = nil
+            heatmapVertexCount = 0
+            return
+        }
+        var verts: [HeatmapVertexIn] = []
+        verts.reserveCapacity(samples.count * 2)
+        for s in samples {
+            let timeNorm = 1.0 - s.ageSeconds / Double(visibleSeconds)
+            let along = Float(timeNorm) * 2.0 - 1.0
+            verts.append(HeatmapVertexIn(along: along, across: -1, magnitude: s.magnitude))
+            verts.append(HeatmapVertexIn(along: along, across:  1, magnitude: s.magnitude))
+        }
+        heatmapVertexCount = verts.count
+        let len = MemoryLayout<HeatmapVertexIn>.stride * verts.count
+        if heatmapVertexBuffer == nil || heatmapVertexBuffer!.length < len {
+            heatmapVertexBuffer = device.makeBuffer(length: max(len, 1024), options: .storageModeShared)
+        }
+        heatmapVertexBuffer!.contents().copyMemory(from: verts, byteCount: len)
+    }
+
+    // Returns the spectrogram texture and its current write head so a snapshot
+    // can be made by the export pipeline without touching internal renderer state.
+    func snapshotTexture() -> (MTLTexture, Int) { (spectroTexture, writeColumn) }
+    func currentVisibleSecondsCap() -> Float { visibleSeconds }
+
     // MARK: - MTKViewDelegate
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
@@ -256,7 +281,6 @@ final class SpectrogramRenderer: NSObject, MTKViewDelegate {
             let cb = queue.makeCommandBuffer()
         else { return }
 
-        // Refresh uniforms
         uniforms.writeHeadNorm = Float(writeColumn) / Float(textureColumns)
         uniforms.dbFloor = dbFloor
         uniforms.dbCeil = dbCeil
@@ -271,11 +295,12 @@ final class SpectrogramRenderer: NSObject, MTKViewDelegate {
         case .live: uniforms.scrubOffsetNorm = 0
         case .paused(let off): uniforms.scrubOffsetNorm = Float(off / Double(max(0.001, visibleSeconds)))
         }
+        uniforms.showHeatmap = heatmapEnabled ? 1 : 0
+        uniforms.bandSizeNorm = 0.06
 
         guard let encoder = cb.makeRenderCommandEncoder(descriptor: descriptor) else { return }
         encoder.label = "ttuner.spectrogram"
 
-        // Pass 1: spectrogram fullscreen
         encoder.setRenderPipelineState(pipeline)
         encoder.setFragmentTexture(spectroTexture, index: 0)
         encoder.setFragmentTexture(colormapTexture, index: 1)
@@ -283,23 +308,25 @@ final class SpectrogramRenderer: NSObject, MTKViewDelegate {
         encoder.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
 
-        // Pass 2: beat markers (line list)
         if let bvb = beatVertexBuffer, beatInstanceCount > 0 {
             encoder.setRenderPipelineState(beatPipeline)
             encoder.setVertexBuffer(bvb, offset: 0, index: 0)
             encoder.setVertexBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
-            // 2 verts per marker as a `line` list
-            encoder.drawPrimitives(type: .line,
-                                   vertexStart: 0,
-                                   vertexCount: beatInstanceCount * 2)
+            encoder.drawPrimitives(type: .line, vertexStart: 0, vertexCount: beatInstanceCount * 2)
         }
 
-        // Pass 3: pitch trail (line strip)
         if let pvb = pitchVertexBuffer, pitchVertexCount > 1 {
             encoder.setRenderPipelineState(pitchPipeline)
             encoder.setVertexBuffer(pvb, offset: 0, index: 0)
             encoder.setVertexBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
             encoder.drawPrimitives(type: .lineStrip, vertexStart: 0, vertexCount: pitchVertexCount)
+        }
+
+        if heatmapEnabled, let hvb = heatmapVertexBuffer, heatmapVertexCount > 1 {
+            encoder.setRenderPipelineState(heatmapPipeline)
+            encoder.setVertexBuffer(hvb, offset: 0, index: 0)
+            encoder.setVertexBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: heatmapVertexCount)
         }
 
         encoder.endEncoding()

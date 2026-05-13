@@ -2,12 +2,14 @@ import Foundation
 import Observation
 import CoreMotion
 import QuartzCore
+import UIKit
 
 @Observable
 final class AppState {
     // Sub-states
     let tuner = TunerState()
     let metronome = MetronomeEngine()
+    @ObservationIgnored let intonationHistory = IntonationHistory(capacity: 2048)
 
     // Display
     var orientation: AppOrientation = .portrait
@@ -15,7 +17,7 @@ final class AppState {
     var zoomMinHz: Float = 50
     var zoomMaxHz: Float = 4_000
 
-    // Settings (live mirror of AppSettings)
+    // Settings live mirror
     var settings: AppSettings {
         didSet { settings.save(); applySettings() }
     }
@@ -26,21 +28,30 @@ final class AppState {
     var showSettings: Bool = false
     var showMetronomeSheet: Bool = false
     var pausedToastVisible: Bool = false
-    var autoTuneInSuggestion: Double? = nil  // suggested BPM if any
+    var autoTuneInSuggestion: Double? = nil
+    var pendingShareItems: [URL] = []
+    var showShareSheet: Bool = false
     var motionState: MotionState = .unknown
+    /// Glow alpha in [0,1] for the screen edges. The view picks color from the sign.
+    var loudnessGlowLevel: Float = 0
+    /// Negative value = too quiet (yellow), positive = too loud (red).
+    var loudnessGlowSign: Float = 0
+    /// 0..1 scalar applied to glass cards & spectrogram in Discreet Mode.
+    var discreetDim: Float = 0
 
     // Internal
     @ObservationIgnored private var captureEngine: CaptureEngine?
     @ObservationIgnored private var analysisEngine: AnalysisEngine?
     @ObservationIgnored private var timeline: TimelineRingBuffer?
     @ObservationIgnored private var bridge: SpectrogramBridge?
-    @ObservationIgnored private var didBootstrap = false
     @ObservationIgnored private let motion = CMMotionManager()
     @ObservationIgnored private var onsetHistory: [TimeInterval] = []
     @ObservationIgnored private var prevSpectrum: [Float]?
     @ObservationIgnored private var lastSilentSince: TimeInterval?
     @ObservationIgnored private var lastStableAccelDate: Date?
     @ObservationIgnored private var lastMovingAccelDate: Date?
+    @ObservationIgnored private var didBootstrap = false
+    @ObservationIgnored private var brightnessObserver: NSObjectProtocol?
 
     enum MotionState { case unknown, stable, moving, paused }
 
@@ -68,6 +79,7 @@ final class AppState {
             }
         }
         startMotionMonitoring()
+        observeBrightness()
     }
 
     func teardown() {
@@ -75,9 +87,11 @@ final class AppState {
         captureEngine?.stop()
         metronome.stop()
         motion.stopDeviceMotionUpdates()
+        if let o = brightnessObserver {
+            NotificationCenter.default.removeObserver(o)
+        }
     }
 
-    // MARK: - Engines
     private func startEngines() {
         let capture = CaptureEngine(capacitySeconds: 12)
         do {
@@ -121,6 +135,7 @@ final class AppState {
             guard let self else { return }
             DispatchQueue.main.async {
                 self.rmsDb = db
+                self.updateLoudnessGlow(db: db)
                 self.evaluateSilenceAwarePause(db: db)
             }
         }
@@ -141,8 +156,19 @@ final class AppState {
             display: settings.noteDisplay
         )
         tuner.update(with: event, reading: reading, stabilityCents: settings.stabilityCents)
+        if let r = reading {
+            let mag = Float(min(50, abs(r.cents))) / 50.0
+            intonationHistory.append(hostTime: event.hostTime, magnitude: mag)
+        }
         bridge?.updatePitchTrail(tuner.trail, referenceA: settings.referenceA, transpose: settings.transpose)
+        // When scrubbing, also push the heatmap snapshot each pitch tick.
+        if scrubMode.isLive == false, settings.intonationHeatmap {
+            let snap = intonationHistory.snapshot(secondsBack: Double(zoomVisibleSeconds))
+            bridge?.updateHeatmap(snap)
+        }
     }
+
+    private var zoomVisibleSeconds: Float { bridge?.visibleSeconds ?? 8 }
 
     // MARK: - Settings application
     func applySettings() {
@@ -157,7 +183,11 @@ final class AppState {
             metronome.bpm = settings.defaultBPM
             metronome.timeSignature = settings.defaultTimeSignature
             metronome.accentPattern = TimeSignature.defaultAccentPattern(for: settings.defaultTimeSignature)
+            metronome.countInBars = settings.countInBars
         }
+        // Heatmap visibility follows scrub mode + setting toggle.
+        bridge?.heatmapEnabled = !scrubMode.isLive && settings.intonationHeatmap
+        applyDiscreetMode(forceImmediate: false)
     }
 
     // MARK: - Orientation
@@ -189,6 +219,11 @@ final class AppState {
             scrubMode = .live
         }
         bridge?.scrubMode = scrubMode
+        bridge?.heatmapEnabled = !scrubMode.isLive && settings.intonationHeatmap
+        if !scrubMode.isLive {
+            let snap = intonationHistory.snapshot(secondsBack: Double(zoomVisibleSeconds))
+            bridge?.updateHeatmap(snap)
+        }
     }
 
     func nudgeScrub(deltaSeconds: Double) {
@@ -198,7 +233,28 @@ final class AppState {
         bridge?.scrubMode = scrubMode
     }
 
-    // MARK: - Auto-tune-in (very simple spectral-flux peak detector)
+    // MARK: - Auto Export
+    func exportVisibleClip() {
+        var urls: [URL] = []
+        let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+        if let view = bridge?.metalView,
+           let png = Exporter.snapshot(view: view, name: "ttuner-\(stamp)") {
+            urls.append(png)
+        }
+        if let rb = captureEngine?.ringBuffer,
+           let sr = captureEngine?.sampleRate,
+           let wav = Exporter.writeRecentAudio(buffer: rb,
+                                               sampleRate: sr,
+                                               seconds: 10,
+                                               name: "ttuner-\(stamp)") {
+            urls.append(wav)
+        }
+        guard !urls.isEmpty else { return }
+        pendingShareItems = urls
+        showShareSheet = true
+    }
+
+    // MARK: - Auto-tune-in
     private func evaluateOnsetForAutoTuneIn(_ frame: SpectrumFrame) {
         guard settings.autoTuneIn, metronome.isPlaying == false else { return }
         if let prev = prevSpectrum, prev.count == frame.bins.count {
@@ -207,11 +263,10 @@ final class AppState {
                 let d = frame.bins[i] - prev[i]
                 if d > 0 { flux += d }
             }
-            // Cheap adaptive threshold: only "loud-ish" flux
             if flux > 80 {
                 let now = CACurrentMediaTime()
                 if let last = onsetHistory.last, now - last < 0.06 {
-                    // ignore — within minimum spacing
+                    // ignore
                 } else {
                     onsetHistory.append(now)
                     if onsetHistory.count > 8 { onsetHistory.removeFirst(onsetHistory.count - 8) }
@@ -262,6 +317,61 @@ final class AppState {
             }
         } else {
             lastSilentSince = nil
+        }
+    }
+
+    // MARK: - Loudness glow
+    private func updateLoudnessGlow(db: Float) {
+        guard settings.loudnessGlow else {
+            loudnessGlowLevel = 0
+            loudnessGlowSign = 0
+            return
+        }
+        // Mapping: < -40dB → quiet (yellow), > -3dB → loud (red), else 0
+        if db < -40 {
+            let mag = min(1, max(0, (-40 - db) / 30.0))
+            loudnessGlowLevel = mag
+            loudnessGlowSign = -1
+        } else if db > -3 {
+            let mag = min(1, max(0, (db - -3) / 20.0))
+            loudnessGlowLevel = mag
+            loudnessGlowSign = 1
+        } else {
+            loudnessGlowLevel = max(0, loudnessGlowLevel - 0.05)
+            if loudnessGlowLevel == 0 { loudnessGlowSign = 0 }
+        }
+    }
+
+    // MARK: - Discreet Mode (auto by ambient brightness)
+    private func observeBrightness() {
+        brightnessObserver = NotificationCenter.default.addObserver(
+            forName: UIScreen.brightnessDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.applyDiscreetMode(forceImmediate: false)
+        }
+        applyDiscreetMode(forceImmediate: true)
+    }
+
+    private func applyDiscreetMode(forceImmediate: Bool) {
+        guard settings.discreetModeAuto else {
+            discreetDim = 0
+            return
+        }
+        // Heuristic: brightness < 0.25 → dim glass cards & spectrogram.
+        let brightness = UIScreen.main.brightness
+        let target: Float = brightness < 0.25 ? 0.3 : 0.0
+        if forceImmediate {
+            discreetDim = target
+        } else {
+            // Smoothly transition.
+            let step: Float = 0.05
+            if abs(target - discreetDim) < step {
+                discreetDim = target
+            } else {
+                discreetDim += (target > discreetDim ? step : -step)
+            }
         }
     }
 
