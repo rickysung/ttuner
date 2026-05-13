@@ -15,9 +15,21 @@ final class MetronomeEngine {
     var hapticOnBeat: Bool = false
     var btLatencyCompensation: Bool = true
 
-    // Observed beat marker queue (most-recent appended)
+    // Mode + advanced options
+    var mode: MetronomeMode = .simple { didSet { if isPlaying { rebuildSchedule() } } }
+    /// How many bars of count-in to play before the actual cycle. 0 disables.
+    var countInBars: Int = 0
+    /// 1 = off. 2/3/4 split each beat. Visual-only by default.
+    var subdivision: Int = 1
+    /// Whether subdivisions also produce a soft audible tick.
+    var subdivisionAudible: Bool = false
+
+    /// Indicates that the scheduler is currently in count-in lead-in.
+    private(set) var inCountIn: Bool = false
+
+    // Observed beat marker queue
     private(set) var markers: [BeatMarker] = []
-    private let markersMax = 96
+    private let markersMax = 192
 
     // Engine
     private let engine = AVAudioEngine()
@@ -26,16 +38,20 @@ final class MetronomeEngine {
 
     // Click cache: [Accent : buffer]
     private var clickBuffers: [Accent: AVAudioPCMBuffer] = [:]
+    private var subdivClickBuffer: AVAudioPCMBuffer?
     private var sampleRate: Double = 44_100
 
     // Scheduling
-    private var nextBeatIndex: Int = 0
-    private var nextSampleTime: AVAudioFramePosition = 0
+    private var primaryNextSampleTime: AVAudioFramePosition = 0
+    private var primaryBeatIndex: Int = 0
+    private var secondaryNextSampleTime: AVAudioFramePosition = 0
+    private var secondaryBeatIndex: Int = 0
+    private var countInBeatIndex: Int = 0
+    private var beatsScheduled: Int = 0    // total primary beats scheduled since start (excl. count-in)
     private let lookAheadSeconds: Double = 0.5
     private var scheduleQueue = DispatchQueue(label: "ttuner.metronome.schedule")
     private var timer: DispatchSourceTimer?
 
-    // Visual marker callback (Metal renderer hooks into this)
     var onScheduleMarker: ((BeatMarker) -> Void)?
 
     // Haptics
@@ -80,6 +96,7 @@ final class MetronomeEngine {
                 clickBuffers[a] = b
             }
         }
+        subdivClickBuffer = ClickSoundFactory.buffer(sampleRate: sampleRate, accent: .soft, tone: "subtle")
     }
 
     func start() {
@@ -90,20 +107,22 @@ final class MetronomeEngine {
         }
         prepareHapticsIfNeeded()
         markers.removeAll(keepingCapacity: true)
-        nextBeatIndex = 0
-        // Start ~120ms in the future so first click isn't clipped.
-        if let lastTime = player.lastRenderTime,
-           let _ = player.playerTime(forNodeTime: lastTime) {
-            nextSampleTime = lastTime.sampleTime + AVAudioFramePosition(sampleRate * 0.12)
+        primaryBeatIndex = 0
+        secondaryBeatIndex = 0
+        countInBeatIndex = 0
+        beatsScheduled = 0
+        inCountIn = countInBars > 0
+        let startAhead = AVAudioFramePosition(sampleRate * 0.12)
+        if let lastTime = player.lastRenderTime {
+            primaryNextSampleTime = lastTime.sampleTime + startAhead
         } else {
-            nextSampleTime = AVAudioFramePosition(sampleRate * 0.12)
+            primaryNextSampleTime = startAhead
         }
+        secondaryNextSampleTime = primaryNextSampleTime
         player.play()
         isPlaying = true
-        rebuildSchedule()
-        // Tick the scheduler ~every 100ms to refill the look-ahead window.
         let t = DispatchSource.makeTimerSource(queue: scheduleQueue)
-        t.schedule(deadline: .now() + .milliseconds(50), repeating: .milliseconds(100))
+        t.schedule(deadline: .now() + .milliseconds(20), repeating: .milliseconds(100))
         t.setEventHandler { [weak self] in self?.tick() }
         timer = t
         t.resume()
@@ -117,14 +136,18 @@ final class MetronomeEngine {
             engine.stop()
         }
         isPlaying = false
+        inCountIn = false
     }
 
     private func rebuildSchedule() {
-        // Stop everything pending and re-prime from the next scheduled time.
         player.stop()
         if let lastTime = player.lastRenderTime {
-            nextSampleTime = lastTime.sampleTime + AVAudioFramePosition(sampleRate * 0.12)
+            primaryNextSampleTime = lastTime.sampleTime + AVAudioFramePosition(sampleRate * 0.12)
+            secondaryNextSampleTime = primaryNextSampleTime
         }
+        primaryBeatIndex = 0
+        secondaryBeatIndex = 0
+        beatsScheduled = 0
         player.play()
         tick()
     }
@@ -134,26 +157,113 @@ final class MetronomeEngine {
         guard let now = player.lastRenderTime else { return }
         let lookAheadFrames = AVAudioFramePosition(sampleRate * lookAheadSeconds)
         let horizon = now.sampleTime + lookAheadFrames
-        let framesPerBeat = AVAudioFramePosition(sampleRate * (60.0 / bpm))
-        ensureAccentLength()
         let comp = btLatencyCompensation
             ? AVAudioFramePosition(AudioSessionManager.shared.outputLatency * sampleRate)
             : 0
-        while nextSampleTime < horizon {
-            let accent = accentPattern[nextBeatIndex % accentPattern.count]
-            if accent != .off, let buf = clickBuffers[accent] {
-                let when = AVAudioTime(sampleTime: nextSampleTime, atRate: sampleRate)
-                player.scheduleBuffer(buf, at: when, options: [], completionHandler: nil)
+        ensureAccentLength()
+
+        let numerator = max(1, timeSignature.numerator)
+
+        // Schedule primary track (handles count-in transparently).
+        while primaryNextSampleTime < horizon {
+            // Determine which "logical" beat this is.
+            let totalBeats = primaryBeatIndex
+            let inLeadIn = totalBeats < countInBars * numerator
+            inCountIn = inLeadIn
+
+            let cycleBeat = inLeadIn
+                ? (totalBeats % numerator)
+                : ((totalBeats - countInBars * numerator) % numerator)
+            let accent = accentPattern[cycleBeat % numerator]
+
+            // For count-in beats: emit visual marker only (or use soft tone) and color via countIn track.
+            // For primary beats during ramp: also recompute BPM per-beat.
+            let currentBPM = computeCurrentBPM(beatsScheduled: beatsScheduled, inCountIn: inLeadIn)
+            let framesPerBeat = AVAudioFramePosition(sampleRate * (60.0 / currentBPM))
+
+            // Audible playback
+            if accent != .off {
+                if inLeadIn {
+                    // Count-in uses a softer tone — pick soft variant unconditionally
+                    if let buf = clickBuffers[.soft] {
+                        let when = AVAudioTime(sampleTime: primaryNextSampleTime, atRate: sampleRate)
+                        player.scheduleBuffer(buf, at: when, options: [], completionHandler: nil)
+                    }
+                } else if let buf = clickBuffers[accent] {
+                    let when = AVAudioTime(sampleTime: primaryNextSampleTime, atRate: sampleRate)
+                    player.scheduleBuffer(buf, at: when, options: [], completionHandler: nil)
+                }
             }
-            // Emit a marker host time aligned to the same scheduled point, minus BT latency.
-            let hostTime = AVAudioTime(sampleTime: nextSampleTime - comp, atRate: sampleRate)
-                .extrapolateTime(fromAnchor: now)?.hostTime ?? mach_absolute_time()
-            let marker = BeatMarker(hostTime: hostTime, accent: accent, trackId: 0, bpm: bpm)
+
+            // Subdivision audible / visual ticks within this beat.
+            if subdivision > 1 {
+                let subFrames = framesPerBeat / AVAudioFramePosition(subdivision)
+                for s in 1..<subdivision {
+                    let subWhen = primaryNextSampleTime + subFrames * AVAudioFramePosition(s)
+                    if subdivisionAudible, let buf = subdivClickBuffer {
+                        let when = AVAudioTime(sampleTime: subWhen, atRate: sampleRate)
+                        player.scheduleBuffer(buf, at: when, options: [], completionHandler: nil)
+                    }
+                    let host = hostTime(forSampleTime: subWhen - comp, anchor: now)
+                    let marker = BeatMarker(hostTime: host, accent: .soft, trackId: BeatTrack.subdivision.rawValue, bpm: currentBPM)
+                    DispatchQueue.main.async { [weak self] in self?.append(marker: marker) }
+                }
+            }
+
+            // Primary visual marker (use countIn track id when in lead-in).
+            let trackId: UInt8 = inLeadIn ? BeatTrack.countIn.rawValue : BeatTrack.primary.rawValue
+            let hostTime = self.hostTime(forSampleTime: primaryNextSampleTime - comp, anchor: now)
+            let marker = BeatMarker(hostTime: hostTime, accent: accent, trackId: trackId, bpm: currentBPM)
             DispatchQueue.main.async { [weak self] in self?.append(marker: marker) }
-            if hapticOnBeat { fireHaptic(for: accent) }
-            nextSampleTime += framesPerBeat
-            nextBeatIndex += 1
+
+            if hapticOnBeat && !inLeadIn { fireHaptic(for: accent) }
+
+            primaryNextSampleTime += framesPerBeat
+            primaryBeatIndex += 1
+            if !inLeadIn { beatsScheduled += 1 }
         }
+
+        // Schedule polyrhythm secondary if active.
+        if case .polyrhythm(let sec) = mode, sec > 0 {
+            let primaryBarFrames = AVAudioFramePosition(sampleRate * (60.0 / bpm) * Double(numerator))
+            let secondaryFramesPerBeat = primaryBarFrames / AVAudioFramePosition(sec)
+            // Align secondary to the start of the active (non-count-in) cycle.
+            if secondaryBeatIndex == 0 {
+                let leadInFrames = AVAudioFramePosition(Double(countInBars * numerator) * sampleRate * 60.0 / bpm)
+                secondaryNextSampleTime = (primaryNextSampleTime - AVAudioFramePosition(Double(primaryBeatIndex) * sampleRate * 60.0 / bpm)) + leadInFrames
+                if secondaryNextSampleTime < primaryNextSampleTime - lookAheadFrames {
+                    secondaryNextSampleTime = primaryNextSampleTime
+                }
+            }
+            while secondaryNextSampleTime < horizon {
+                // Don't audibly play the secondary track during count-in.
+                let inLeadIn = inCountIn && countInBars > 0
+                if !inLeadIn, let buf = clickBuffers[.normal] {
+                    let when = AVAudioTime(sampleTime: secondaryNextSampleTime, atRate: sampleRate)
+                    player.scheduleBuffer(buf, at: when, options: [], completionHandler: nil)
+                }
+                let host = hostTime(forSampleTime: secondaryNextSampleTime - comp, anchor: now)
+                let marker = BeatMarker(hostTime: host, accent: .normal, trackId: BeatTrack.secondary.rawValue, bpm: bpm)
+                DispatchQueue.main.async { [weak self] in self?.append(marker: marker) }
+                secondaryNextSampleTime += secondaryFramesPerBeat
+                secondaryBeatIndex += 1
+            }
+        }
+    }
+
+    private func computeCurrentBPM(beatsScheduled: Int, inCountIn: Bool) -> Double {
+        if inCountIn { return bpm }
+        if case .gradual(let s, let e, let bars) = mode {
+            let totalBeats = max(1, bars * timeSignature.numerator)
+            let t = min(1.0, Double(beatsScheduled) / Double(totalBeats))
+            return s + (e - s) * t
+        }
+        return bpm
+    }
+
+    private func hostTime(forSampleTime sampleTime: AVAudioFramePosition, anchor: AVAudioTime) -> UInt64 {
+        let t = AVAudioTime(sampleTime: sampleTime, atRate: sampleRate)
+        return t.extrapolateTime(fromAnchor: anchor)?.hostTime ?? mach_absolute_time()
     }
 
     private func append(marker: BeatMarker) {
@@ -168,17 +278,16 @@ final class MetronomeEngine {
         guard isPlaying else { return }
         let steps = 12
         let interval = duration / Double(steps)
-        var current: Float = mixer.outputVolume
+        let original = mixer.outputVolume
         for s in 1...steps {
             scheduleQueue.asyncAfter(deadline: .now() + interval * Double(s)) { [weak self] in
                 guard let self else { return }
                 let frac = Float(s) / Float(steps)
-                self.mixer.outputVolume = current * (1 - frac)
+                self.mixer.outputVolume = original * (1 - frac)
                 if s == steps {
                     DispatchQueue.main.async {
                         self.stop()
-                        self.mixer.outputVolume = 1
-                        current = 1
+                        self.mixer.outputVolume = original
                     }
                 }
             }
@@ -236,7 +345,7 @@ final class MetronomeEngine {
             let player = try engine.makePlayer(with: pattern)
             try player.start(atTime: 0)
         } catch {
-            // Silently ignore haptic failures during playback
+            // ignore
         }
     }
 }

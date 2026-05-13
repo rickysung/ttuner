@@ -18,7 +18,13 @@ struct ContentView: View {
                     .ignoresSafeArea()
                     .gesture(scrubGesture)
                     .gesture(pinchGesture)
+                    .gesture(exportGesture)
                     .onTapGesture(count: 2) { state.resetZoom() }
+                    .opacity(1 - Double(state.discreetDim) * 0.6)
+
+                LoudnessGlowOverlay(level: state.loudnessGlowLevel,
+                                     sign: state.loudnessGlowSign)
+                    .animation(.easeInOut(duration: 0.25), value: state.loudnessGlowLevel)
 
                 if AppOrientation.from(geo.size).isLandscape {
                     HStack {
@@ -34,6 +40,7 @@ struct ContentView: View {
                         .padding(.trailing, 12)
                     }
                     .padding(.vertical, 12)
+                    .opacity(1 - Double(state.discreetDim))
                 } else {
                     VStack(alignment: .leading, spacing: 12) {
                         HStack(alignment: .top) {
@@ -48,6 +55,17 @@ struct ContentView: View {
                             .padding(.horizontal, 12)
                             .padding(.bottom, 12)
                     }
+                    .opacity(1 - Double(state.discreetDim))
+                }
+
+                if state.metronome.inCountIn {
+                    Text("Count-in")
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 10).padding(.vertical, 4)
+                        .background(Color.orange.opacity(0.85), in: Capsule())
+                        .foregroundStyle(.white)
+                        .padding(.top, 60)
+                        .transition(.opacity)
                 }
 
                 if state.pausedToastVisible {
@@ -90,6 +108,9 @@ struct ContentView: View {
             }
             .sheet(isPresented: $binding.showMetronomeSheet) { MetronomeSheet(state: state) }
             .sheet(isPresented: $binding.showSettings) { SettingsView(state: state) }
+            .sheet(isPresented: $binding.showShareSheet) {
+                ShareSheet(items: state.pendingShareItems)
+            }
         }
         .preferredColorScheme(.dark)
         .statusBarHidden(true)
@@ -153,6 +174,15 @@ struct ContentView: View {
                 let newMin = Float(exp(max(log(20.0), center - half)))
                 let newMax = Float(exp(min(log(20_000.0), center + half)))
                 state.setZoom(minHz: newMin, maxHz: newMax)
+            }
+    }
+
+    /// Two-finger long press triggers Auto Export of the current scrub window.
+    private var exportGesture: some Gesture {
+        LongPressGesture(minimumDuration: 0.8)
+            .onEnded { _ in
+                guard !state.scrubMode.isLive else { return }
+                state.exportVisibleClip()
             }
     }
 }

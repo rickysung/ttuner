@@ -1,8 +1,6 @@
 import SwiftUI
 import MetalKit
 
-/// UIViewRepresentable that hosts the Metal spectrogram and exposes the renderer
-/// to SwiftUI so other layers can push columns and update uniforms.
 struct MetalSpectrogramView: UIViewRepresentable {
     @ObservedObject var bridge: SpectrogramBridge
 
@@ -21,6 +19,7 @@ struct MetalSpectrogramView: UIViewRepresentable {
                                               textureColumns: 1024) {
             bridge.attach(renderer: renderer)
         }
+        bridge.metalView = view
         return view
     }
 
@@ -29,12 +28,10 @@ struct MetalSpectrogramView: UIViewRepresentable {
     }
 }
 
-/// Thin observable wrapper bridging the SwiftUI side (which owns AppState) to
-/// the renderer instance. SwiftUI cannot directly hold an `MTKView` so this
-/// `bridge` object outlives view recreation.
 final class SpectrogramBridge: ObservableObject {
     let displayBins: Int
     private(set) var renderer: SpectrogramRenderer?
+    weak var metalView: MTKView?
 
     var visibleSeconds: Float = 8 { didSet { renderer?.visibleSeconds = visibleSeconds } }
     var displayMinHz: Float = 50 { didSet { renderer?.displayMinHz = displayMinHz } }
@@ -46,6 +43,7 @@ final class SpectrogramBridge: ObservableObject {
     var dbCeil: Float = 0 { didSet { renderer?.dbCeil = dbCeil } }
     var contentMinHz: Float = 50 { didSet { renderer?.contentMinHz = contentMinHz } }
     var contentMaxHz: Float = 20_000 { didSet { renderer?.contentMaxHz = contentMaxHz } }
+    var heatmapEnabled: Bool = false { didSet { renderer?.heatmapEnabled = heatmapEnabled } }
 
     init(displayBins: Int) {
         self.displayBins = displayBins
@@ -66,6 +64,7 @@ final class SpectrogramBridge: ObservableObject {
         renderer?.dbCeil = dbCeil
         renderer?.contentMinHz = contentMinHz
         renderer?.contentMaxHz = contentMaxHz
+        renderer?.heatmapEnabled = heatmapEnabled
         renderer?.setColormap(colormap)
     }
 
@@ -79,5 +78,9 @@ final class SpectrogramBridge: ObservableObject {
 
     func updatePitchTrail(_ trail: [PitchEvent], referenceA: Double, transpose: Int) {
         renderer?.updatePitchTrail(trail, referenceA: referenceA, transpose: transpose)
+    }
+
+    func updateHeatmap(_ samples: [(ageSeconds: Double, magnitude: Float)]) {
+        renderer?.updateHeatmap(samples: samples)
     }
 }
