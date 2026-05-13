@@ -3,6 +3,9 @@
 A full-screen, glass-morphic iOS tuner & metronome built around a Metal spectrogram.
 See `ttuner-design-spec.docx` for the full design spec.
 
+> 새로 macOS 환경에서 작업을 이어 받는다면 먼저 [`HANDOFF.md`](./HANDOFF.md) 를 읽어 주세요.
+> 첫 빌드 체크리스트, 동작 확인 시나리오, 미완 작업 후보가 정리되어 있습니다.
+
 ## 빌드 & 실행
 
 이 저장소는 macOS의 **Xcode 15.3+** 가 필요합니다.
@@ -138,6 +141,18 @@ MetronomeEngine (자체 스케줄러)
 - `LogBinnerTests`: 단조성, max pooling
 - `WAVWriterTests`: 헤더 라운드트립
 - `TimeSignatureTests`: 4/4, 3/4, 6/8 기본 강세 패턴
+
+## 프로젝트 파일 재생성
+
+`ttuner.xcodeproj/project.pbxproj` 는 손으로 두지 않고 결정적 UUID로 생성합니다.
+새 소스 파일을 추가했다면 다음을 실행하고 산출물을 함께 커밋하세요:
+
+```bash
+python3 scripts/gen_xcodeproj.py
+```
+
+스크립트는 `ttuner/`와 `ttunerTests/` 디렉터리를 스캔하여 `.swift`와 `.metal`
+파일을 자동으로 발견합니다.
 
 ## 빌드 트러블슈팅
 
