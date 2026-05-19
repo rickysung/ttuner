@@ -17,7 +17,10 @@ struct TimeSignature: Equatable, Codable {
         case (3, 4): return [.accent, .normal, .normal]
         case (4, 4): return [.accent, .normal, .soft, .normal]
         case (6, 8): return [.accent, .soft, .soft, .normal, .soft, .soft]
-        default:     return Array(repeating: .normal, count: max(1, sig.numerator)).enumerated().map { $0.offset == 0 ? .accent : .normal }
+        default:
+            var pattern = Array(repeating: Accent.normal, count: max(1, sig.numerator))
+            if !pattern.isEmpty { pattern[0] = .accent }
+            return pattern
         }
     }
 }

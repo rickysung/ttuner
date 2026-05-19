@@ -17,29 +17,31 @@ struct SettingsView: View {
                     }
                 }
 
-                Section("FFT & 디스플레이") {
-                    Picker("FFT 크기", selection: $state.settings.fftSize) {
-                        Text("2048").tag(2048)
-                        Text("4096").tag(4096)
-                        Text("8192").tag(8192)
-                    }
-                    Picker("표시 빈 수", selection: $state.settings.displayBins) {
-                        Text("256").tag(256)
-                        Text("512").tag(512)
-                        Text("1024").tag(1024)
-                    }
+                Section("디스플레이") {
                     Picker("컬러맵", selection: $state.settings.colormap) {
                         ForEach(ColormapKind.allCases, id: \.self) { Text($0.label).tag($0) }
                     }
                     HStack {
                         Text("dB 하한")
-                        Slider(value: $state.settings.dbFloor, in: -120...(-30))
+                        Slider(value: $state.settings.dbFloor, in: -90...0)
                         Text("\(Int(state.settings.dbFloor))").monospacedDigit().frame(width: 36, alignment: .trailing)
                     }
                     HStack {
                         Text("dB 상한")
-                        Slider(value: $state.settings.dbCeil, in: -20...20)
+                        Slider(value: $state.settings.dbCeil, in: 0...80)
                         Text("\(Int(state.settings.dbCeil))").monospacedDigit().frame(width: 36, alignment: .trailing)
+                    }
+                    HStack {
+                        Text("스무딩")
+                        Slider(value: $state.settings.spectroBlur, in: 0...1)
+                        Text(String(format: "%.0f%%", state.settings.spectroBlur * 100))
+                            .monospacedDigit().frame(width: 44, alignment: .trailing)
+                    }
+                    HStack {
+                        Text("볼륨 바 투명도")
+                        Slider(value: $state.settings.volumeBarOpacity, in: 0...1)
+                        Text(String(format: "%.0f%%", state.settings.volumeBarOpacity * 100))
+                            .monospacedDigit().frame(width: 44, alignment: .trailing)
                     }
                 }
 

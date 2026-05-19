@@ -6,7 +6,8 @@ import AVFoundation
 /// beyond the ring buffer's brief unfair-lock window.
 final class CaptureEngine {
     let ringBuffer: AudioRingBuffer
-    private let engine = AVAudioEngine()
+    private let shared = SharedAudioEngine.shared
+    private var engine: AVAudioEngine { shared.engine }
     private var converter: AVAudioConverter?
     private var targetFormat: AVAudioFormat?
     private(set) var sampleRate: Double = 48_000
@@ -43,13 +44,12 @@ final class CaptureEngine {
             self?.handle(buffer: buffer, sourceFormat: hwFormat)
         }
 
-        engine.prepare()
-        try engine.start()
+        try shared.startIfNeeded()
     }
 
     func stop() {
         engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
+        shared.stop()
     }
 
     private func ensureScratch(capacity: Int) {

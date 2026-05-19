@@ -21,6 +21,7 @@ struct MetronomeSheet: View {
                         Text("\(Int(state.metronome.bpm.rounded()))").monospacedDigit().frame(width: 50, alignment: .trailing)
                     }
                     Button("Tap Tempo") { state.metronome.registerTap() }
+                    Toggle("BPM 자동 인식", isOn: $state.settings.autoTuneIn)
                 }
 
                 Section("박자") {
@@ -131,6 +132,11 @@ struct MetronomeSheet: View {
             gradualStart = s
             gradualEnd = e
             gradualBars = b
+        case .speedTrainer:
+            // Speed Trainer mode is configured via MetronomePanel's
+            // practice section, not this legacy sheet. Show the simple
+            // tab as a sensible default if the user wandered here.
+            modeTab = .simple
         }
     }
 

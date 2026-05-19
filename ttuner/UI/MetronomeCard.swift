@@ -3,6 +3,7 @@ import SwiftUI
 struct MetronomeCard: View {
     @Bindable var state: AppState
     var onShowSheet: () -> Void
+    var onShowSettings: () -> Void
 
     var body: some View {
         GlassCard {
@@ -17,28 +18,38 @@ struct MetronomeCard: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel(state.metronome.isPlaying ? "Stop metronome" : "Start metronome")
 
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Text("\(Int(state.metronome.bpm.rounded()))")
-                            .font(.system(size: 36, weight: .bold, design: .rounded))
-                            .monospacedDigit()
-                        Text("BPM").font(.caption).foregroundStyle(.secondary)
-                    }
-                    HStack(spacing: 6) {
-                        Text(state.metronome.timeSignature.label)
-                            .font(.subheadline.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                        accentDots
-                    }
-                }
-                Spacer(minLength: 0)
+                // Tap the BPM/time-sig area to dive into the metronome detail
+                // sheet. Keeps the always-on surface minimal while one tap
+                // away from the full picker.
                 Button(action: onShowSheet) {
-                    Image(systemName: "slider.horizontal.3")
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text("\(Int(state.metronome.bpm.rounded()))")
+                                .font(.system(size: 36, weight: .bold, design: .rounded))
+                                .monospacedDigit()
+                                .foregroundStyle(.primary)
+                            Text("BPM").font(.caption).foregroundStyle(.secondary)
+                        }
+                        HStack(spacing: 6) {
+                            Text(state.metronome.timeSignature.label)
+                                .font(.subheadline.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                            accentDots
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                Spacer(minLength: 0)
+                Button(action: onShowSettings) {
+                    Image(systemName: "gearshape.fill")
                         .font(.system(size: 18, weight: .semibold))
                         .padding(8)
                         .background(.ultraThinMaterial, in: Circle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Settings")
             }
             .gesture(LongPressGesture(minimumDuration: 0.5).onEnded { _ in state.metronome.registerTap() })
         }

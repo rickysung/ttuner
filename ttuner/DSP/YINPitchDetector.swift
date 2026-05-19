@@ -14,7 +14,7 @@ final class YINPitchDetector {
 
     init(windowSize: Int = 2048,
          sampleRate: Float,
-         threshold: Float = 0.15,
+         threshold: Float = 0.10,
          minFrequency: Float = 40,
          maxFrequency: Float = 2400) {
         self.windowSize = windowSize
